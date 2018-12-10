@@ -34,6 +34,7 @@
 #include <net/seg6_local.h>
 #include <linux/etherdevice.h>
 #include <linux/bpf.h>
+#include <linux/kernel.h>
 
 struct seg6_local_lwt;
 
@@ -457,6 +458,155 @@ drop:
 	return err;
 }
 
+static int insert_segment(struct sk_buff *skb, struct in6_addr * segment)
+{
+	struct ipv6hdr *hdr, *oldhdr;
+	struct ipv6_sr_hdr * srh;
+	int err;
+	int hdrlen;
+
+	srh = get_and_validate_srh(skb);
+
+	hdrlen = (srh->hdrlen + 1) << 3;
+	srh->hdrlen += 2;
+	srh->first_segment += 1;
+	srh->segments_left = srh->first_segment;
+
+	err = skb_cow_head(skb, hdrlen + skb->mac_len);
+	if (unlikely(err))
+		return err;
+
+	oldhdr = ipv6_hdr(skb);
+
+	skb_push(skb, sizeof(struct in6_addr));
+	skb_reset_network_header(skb);
+	skb_mac_header_rebuild(skb);
+
+	hdr = ipv6_hdr(skb);
+	memmove(hdr, oldhdr, sizeof(struct ipv6hdr) + hdrlen);
+
+	memcpy((void *)hdr + sizeof(struct ipv6hdr) + hdrlen, segment, sizeof(struct in6_addr));
+	hdr->daddr = *segment;
+
+	hdr->payload_len = htons(ntohs(hdr->payload_len) + sizeof(struct in6_addr));
+	hdr->hop_limit--;
+
+	return 0;
+}
+
+static int check_puzzle(uint64_t puzzle)
+{
+	const uint64_t completed = 0x000001230456078fu;
+	return completed == puzzle;
+}
+
+static uint64_t swap_puzzle_piece(uint64_t puzzle, int pos, int diff)
+{
+	int new_pos;
+	uint64_t tmp_old;
+	uint64_t tmp_new;
+       
+	new_pos = pos + diff;
+
+	tmp_old = 0xf & (puzzle >> (pos * 4));
+	tmp_new = 0xf & (puzzle >> (new_pos * 4));
+
+	puzzle &= ~(0xf << (pos * 4));
+	puzzle &= ~(0xf << (new_pos * 4));
+
+	puzzle |= tmp_old << (new_pos * 4);
+	puzzle |= tmp_new << (pos * 4);
+
+	return puzzle;
+
+}
+
+static int update_puzzle(uint64_t puzzle, int pos, uint32_t operation, struct in6_addr * segment)
+{
+	const int puzzle_piece_diff[SEG6_LOCAL_ACTION_END_PUZZLE_MAX] = {
+		[SEG6_LOCAL_ACTION_END_PUZZLE_UP] = 4,
+		[SEG6_LOCAL_ACTION_END_PUZZLE_DOWN] = -4,
+		[SEG6_LOCAL_ACTION_END_PUZZLE_LEFT] = 1,
+		[SEG6_LOCAL_ACTION_END_PUZZLE_RIGHT] = -1
+	};
+
+	uint64_t new_puzzle = swap_puzzle_piece(puzzle, pos, puzzle_piece_diff[operation]);
+	segment->s6_addr32[2] = htonl((uint32_t)((0x0000ffff & (new_puzzle >> 32)) + (operation << 16)));
+	segment->s6_addr32[3] = htonl((uint32_t)(0xffffffff & new_puzzle));
+
+	return 0;
+}
+
+static int next_puzzle_operation(struct sk_buff *skb, uint64_t puzzle, int pos,
+	       uint32_t operation, struct in6_addr * segment)
+{
+		struct in6_addr new_segment;
+		struct sk_buff * new_skb;
+
+		new_skb = skb_copy(skb, GFP_KERNEL);
+		memcpy(&new_segment, segment, sizeof(struct in6_addr));
+
+		update_puzzle(puzzle, pos, operation, &new_segment);
+		insert_segment(new_skb, &new_segment);
+		seg6_lookup_nexthop(new_skb, NULL, 0);
+
+		return dst_input(new_skb);
+}
+
+static int input_action_end_puzzle(struct sk_buff *skb, struct seg6_local_lwt *slwt)
+{
+	struct ipv6_sr_hdr *srh;
+	struct in6_addr *segment;
+	uint64_t puzzle;
+	uint16_t prev_operation;
+	int pos;
+
+	srh = get_and_validate_srh(skb);
+	if (!srh) {
+		goto drop;
+	}
+
+	if (ipv6_hdr(skb)->hop_limit == 0) {
+		goto drop;
+	}
+
+	segment = srh->segments + srh->segments_left;
+	puzzle = ntohl(segment->s6_addr32[3])
+	       + ((uint64_t)(0xffff & ntohl(segment->s6_addr32[2])) << 32);
+
+	if (check_puzzle(puzzle)) {
+		srh->segments_left = 0;
+		ipv6_hdr(skb)->daddr = srh->segments[srh->segments_left];
+		seg6_lookup_nexthop(skb, NULL, 0);
+		return dst_input(skb);
+	}
+
+	prev_operation = segment->s6_addr16[4];
+	for (pos = 0; pos < 12 && ((puzzle >> (pos * 4)) & 0xf) != 0xf; pos++);
+
+	if (pos != 10 && pos != 6 && pos != 2 && prev_operation != SEG6_LOCAL_ACTION_END_PUZZLE_RIGHT) {
+		next_puzzle_operation(skb, puzzle, pos, SEG6_LOCAL_ACTION_END_PUZZLE_LEFT, segment);
+	}
+
+	if (pos != 8 && pos != 4 && pos != 0 && prev_operation != SEG6_LOCAL_ACTION_END_PUZZLE_LEFT) {
+		next_puzzle_operation(skb, puzzle, pos, SEG6_LOCAL_ACTION_END_PUZZLE_RIGHT, segment);
+	}
+
+	if (pos != 10 && pos != 9 && pos != 8 && prev_operation != SEG6_LOCAL_ACTION_END_PUZZLE_DOWN) {
+		next_puzzle_operation(skb, puzzle, pos, SEG6_LOCAL_ACTION_END_PUZZLE_UP, segment);
+	}
+
+	if (pos != 2 && pos != 1 && pos != 0 && prev_operation != SEG6_LOCAL_ACTION_END_PUZZLE_UP) {
+		next_puzzle_operation(skb, puzzle, pos, SEG6_LOCAL_ACTION_END_PUZZLE_DOWN, segment);
+	}
+
+	return 0;
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
 DEFINE_PER_CPU(struct seg6_bpf_srh_state, seg6_bpf_srh_states);
 
 bool seg6_bpf_has_valid_srh(struct sk_buff *skb)
@@ -587,6 +737,11 @@ static struct seg6_action_desc seg6_action_table[] = {
 		.action		= SEG6_LOCAL_ACTION_END_BPF,
 		.attrs		= (1 << SEG6_LOCAL_BPF),
 		.input		= input_action_end_bpf,
+	},
+	{
+		.action		= SEG6_LOCAL_ACTION_END_PUZZLE,
+		.attrs		= 0,
+		.input		= input_action_end_puzzle,
 	},
 
 };

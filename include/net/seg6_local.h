@@ -19,6 +19,13 @@
 #include <linux/net.h>
 #include <linux/ipv6.h>
 
+#define SEG6_LOCAL_ACTION_END_PUZZLE_NONE 0
+#define SEG6_LOCAL_ACTION_END_PUZZLE_UP 1
+#define SEG6_LOCAL_ACTION_END_PUZZLE_DOWN 2
+#define SEG6_LOCAL_ACTION_END_PUZZLE_LEFT 3
+#define SEG6_LOCAL_ACTION_END_PUZZLE_RIGHT 4
+#define SEG6_LOCAL_ACTION_END_PUZZLE_MAX 5
+
 extern int seg6_lookup_nexthop(struct sk_buff *skb, struct in6_addr *nhaddr,
 			       u32 tbl_id);
 extern bool seg6_bpf_has_valid_srh(struct sk_buff *skb);
